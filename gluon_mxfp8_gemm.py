@@ -1,11 +1,9 @@
+import statistics
 import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-"""
-Simple MXFP8 GEMM with scale preshuffling with Gluon.
-"""
 
 try:
     from triton.backends.amd.compiler import HIPOptions
@@ -28,7 +26,7 @@ def is_hip_cdna4():
         return False
     props = torch.cuda.get_device_properties(0)
     name = props.name.lower()
-    return ("mi350" in name) or ("gfx950" in name) or ("cdna4" in name)
+    return ("gfx950" in name) or ("cdna4" in name)
 
 
 def ceil_div(x, y):
@@ -82,6 +80,44 @@ def quantize_b_mx32_fp8(b_bf16: torch.Tensor):
     return q_kn.contiguous(), scales_nq.contiguous()
 
 
+def make_mxfp8_data(M, N, K, device="cuda"):
+    a_bf16 = torch.randn((M, K), device=device, dtype=torch.bfloat16)
+    b_bf16 = torch.randn((K, N), device=device, dtype=torch.bfloat16)
+
+    A, A_scale = quantize_a_mx32_fp8(a_bf16)
+    B, B_scale = quantize_b_mx32_fp8(b_bf16)
+    return A, B, A_scale, B_scale
+
+
+def pad_k_mxfp8(A, B, A_scale, B_scale, BLOCK_K=128):
+    M, K = A.shape
+    Kb, N = B.shape
+    assert K == Kb
+
+    K_pad = ceil_to_multiple(K, BLOCK_K)
+    QK = ceil_div(K, 32)
+    QK_pad = ceil_div(K_pad, 32)
+
+    if K_pad == K:
+        return A, B, A_scale, B_scale, K_pad
+
+    A_pad = torch.zeros((M, K_pad), device=A.device, dtype=A.dtype)
+    B_pad = torch.zeros((K_pad, N), device=B.device, dtype=B.dtype)
+    A_pad[:, :K] = A
+    B_pad[:K, :] = B
+
+    A_scale_pad = torch.ones((M, QK_pad), device=A_scale.device, dtype=torch.float32).to(torch.float8_e8m0fnu)
+    B_scale_pad = torch.ones((N, QK_pad), device=B_scale.device, dtype=torch.float32).to(torch.float8_e8m0fnu)
+    A_scale_pad[:, :QK] = A_scale
+    B_scale_pad[:, :QK] = B_scale
+
+    return A_pad, B_pad, A_scale_pad, B_scale_pad, K_pad
+
+
+def expand_scales_32(scales, K):
+    return scales.float().repeat_interleave(32, dim=1)[:, :K]
+
+
 def shuffle_scales_cdna4_mxfp8(scales: torch.Tensor, mfma_nonkdim: int):
     """
     Input logical shape: [rows, K//32]
@@ -124,7 +160,6 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
 ):
-    # Specialized fast path only.
     gl.static_assert(BLOCK_M == 128)
     gl.static_assert(BLOCK_N == 128)
     gl.static_assert(BLOCK_K == 128)
@@ -164,13 +199,10 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
     )
 
     c_store_layout: gl.constexpr = gl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
-
-    # Raw packed scale tile load layout.
     scale_raw_layout: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [4, 1], [1, 0])
 
     acc = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
 
-    # Hoist invariant row/col bases.
     a_m_idx = off_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, a_load_layout))[:, None]
     b_n_idx = off_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, b_load_layout))[None, :]
 
@@ -191,19 +223,18 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
     a_k_idx_base = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, a_load_layout))[None, :]
     b_k_idx_base = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(1, b_load_layout))[:, None]
 
+    qh: gl.constexpr = BLOCK_K // 128
+    qk: gl.constexpr = BLOCK_K // 32
+
     for k0 in range(0, K, BLOCK_K):
-        # A payload: logical [BLOCK_M, BLOCK_K] from A[M, K]
         a_offs_k = k0 + a_k_idx_base
         a = gl.amd.cdna4.buffer_load(a_ptr, a_m_idx * K + a_offs_k)
         a = gl.convert_layout(a, a_layout)
 
-        # B payload: logical [BLOCK_K, BLOCK_N] from B[K, N]
         b_offs_k = k0 + b_k_idx_base
         b = gl.amd.cdna4.buffer_load(b_ptr, b_offs_k * N + b_n_idx)
         b = gl.convert_layout(b, b_layout)
 
-        # Load raw preshuffled A/B scale tiles: [BLOCK_M//32, BLOCK_K] and [BLOCK_N//32, BLOCK_K]
-        # For BLOCK_M = BLOCK_N = BLOCK_K = 128 this is [4, 128].
         a_scale_col = (k0 // 32) * 32 + a_scale_col_base
         b_scale_col = (k0 // 32) * 32 + b_scale_col_base
 
@@ -216,20 +247,13 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
             b_scale_row * ((K // 32) * 32) + b_scale_col,
         )
 
-        # Inverse of the host-side preshuffle for mfma_nonkdim == 16:
-        # host shuffle was:
-        #   view(rows//32, 2, 16, qh, 4).permute(0, 3, 1, 2, 4)
-        # so inverse is:
-        #   reshape(rows//32, qh, 2, 16, 4).permute(0, 2, 3, 1, 4)
-        qh: gl.constexpr = BLOCK_K // 128  # number of 4-kblock groups in this K tile
-
         a_scale = a_scale_raw.reshape(
             BLOCK_M // 32, qh, 2, 16, 4
-        ).permute(0, 2, 3, 1, 4).reshape(BLOCK_M, BLOCK_K // 32)
+        ).permute(0, 2, 3, 1, 4).reshape(BLOCK_M, qk)
 
         b_scale = b_scale_raw.reshape(
             BLOCK_N // 32, qh, 2, 16, 4
-        ).permute(0, 2, 3, 1, 4).reshape(BLOCK_N, BLOCK_K // 32)
+        ).permute(0, 2, 3, 1, 4).reshape(BLOCK_N, qk)
 
         a_scale = gl.convert_layout(a_scale, a_scale_layout)
         b_scale = gl.convert_layout(b_scale, b_scale_layout)
@@ -245,44 +269,6 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
     out_offs_m = off_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, c_store_layout))[:, None]
     out_offs_n = off_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, c_store_layout))[None, :]
     gl.amd.cdna4.buffer_store(c, out_ptr, out_offs_m * N + out_offs_n)
-
-
-def make_mxfp8_data(M, N, K, device="cuda"):
-    a_bf16 = torch.randn((M, K), device=device, dtype=torch.bfloat16)
-    b_bf16 = torch.randn((K, N), device=device, dtype=torch.bfloat16)
-
-    A, A_scale = quantize_a_mx32_fp8(a_bf16)
-    B, B_scale = quantize_b_mx32_fp8(b_bf16)
-    return A, B, A_scale, B_scale
-
-
-def pad_k_mxfp8(A, B, A_scale, B_scale, BLOCK_K=128):
-    M, K = A.shape
-    Kb, N = B.shape
-    assert K == Kb
-
-    K_pad = ceil_to_multiple(K, BLOCK_K)
-    QK = ceil_div(K, 32)
-    QK_pad = ceil_div(K_pad, 32)
-
-    if K_pad == K:
-        return A, B, A_scale, B_scale, K_pad
-
-    A_pad = torch.zeros((M, K_pad), device=A.device, dtype=A.dtype)
-    B_pad = torch.zeros((K_pad, N), device=B.device, dtype=B.dtype)
-    A_pad[:, :K] = A
-    B_pad[:K, :] = B
-
-    A_scale_pad = torch.ones((M, QK_pad), device=A_scale.device, dtype=torch.float32).to(torch.float8_e8m0fnu)
-    B_scale_pad = torch.ones((N, QK_pad), device=B_scale.device, dtype=torch.float32).to(torch.float8_e8m0fnu)
-    A_scale_pad[:, :QK] = A_scale
-    B_scale_pad[:, :QK] = B_scale
-
-    return A_pad, B_pad, A_scale_pad, B_scale_pad, K_pad
-
-
-def expand_scales_32(scales, K):
-    return scales.float().repeat_interleave(32, dim=1)[:, :K]
 
 
 def prepare_mxfp8_gemm_preshuffled_scales(
@@ -303,7 +289,6 @@ def prepare_mxfp8_gemm_preshuffled_scales(
     assert A_scale.dtype == torch.float8_e8m0fnu
     assert B_scale.dtype == torch.float8_e8m0fnu
 
-    # Specialized fast path only.
     assert BLOCK_M == 128
     assert BLOCK_N == 128
     assert BLOCK_K == 128
@@ -389,6 +374,132 @@ def benchmark_forward_ms(fn, warmup: int = 20, repeat: int = 50) -> float:
     return start.elapsed_time(end) / float(repeat)
 
 
+SHAPES = [
+    ("Llama-2-7B MBS=1", 4096, 12288, 4096),
+    ("Llama-2-7B MBS=1", 4096, 4096, 4096),
+    ("Llama-2-7B MBS=1", 4096, 22016, 4096),
+    ("Llama-2-7B MBS=1", 4096, 4096, 11008),
+    ("Llama-2-7B MBS=2", 8192, 12288, 4096),
+    ("Llama-2-7B MBS=2", 8192, 4096, 4096),
+    ("Llama-2-7B MBS=2", 8192, 22016, 4096),
+    ("Llama-2-7B MBS=2", 8192, 4096, 11008),
+    ("Llama-2-7B MBS=4", 16384, 12288, 4096),
+    ("Llama-2-7B MBS=4", 16384, 4096, 4096),
+    ("Llama-2-7B MBS=4", 16384, 22016, 4096),
+    ("Llama-2-7B MBS=4", 16384, 4096, 11008),
+    ("Llama-2-70B MBS=1", 4096, 10240, 8192),
+    ("Llama-2-70B MBS=1", 4096, 8192, 8192),
+    ("Llama-2-70B MBS=1", 4096, 57344, 8192),
+    ("Llama-2-70B MBS=1", 4096, 8192, 28672),
+    ("Llama-2-70B MBS=2", 8192, 10240, 8192),
+    ("Llama-2-70B MBS=2", 8192, 8192, 8192),
+    ("Llama-2-70B MBS=2", 8192, 57344, 8192),
+    ("Llama-2-70B MBS=2", 8192, 8192, 28672),
+    ("Llama-2-70B MBS=4", 16384, 10240, 8192),
+    ("Llama-2-70B MBS=4", 16384, 8192, 8192),
+    ("Llama-2-70B MBS=4", 16384, 57344, 8192),
+    ("Llama-2-70B MBS=4", 16384, 8192, 28672),
+    ("Llama-3.1-8B MBS=1", 8192, 6144, 4096),
+    ("Llama-3.1-8B MBS=1", 8192, 4096, 4096),
+    ("Llama-3.1-8B MBS=1", 8192, 28672, 4096),
+    ("Llama-3.1-8B MBS=1", 8192, 4096, 14336),
+    ("Llama-3.1-8B MBS=2", 16384, 6144, 4096),
+    ("Llama-3.1-8B MBS=2", 16384, 4096, 4096),
+    ("Llama-3.1-8B MBS=2", 16384, 28672, 4096),
+    ("Llama-3.1-8B MBS=2", 16384, 4096, 14336),
+    ("Llama-3.1-8B MBS=4", 32768, 6144, 4096),
+    ("Llama-3.1-8B MBS=4", 32768, 4096, 4096),
+    ("Llama-3.1-8B MBS=4", 32768, 28672, 4096),
+    ("Llama-3.1-8B MBS=4", 32768, 4096, 14336),
+    ("Llama-3.1-405B MBS=1", 8192, 18432, 16384),
+    ("Llama-3.1-405B MBS=1", 8192, 16384, 16384),
+    ("Llama-3.1-405B MBS=1", 8192, 106496, 16384),
+    ("Llama-3.1-405B MBS=1", 8192, 16384, 53248),
+    ("Llama-3.1-405B MBS=2", 16384, 18432, 16384),
+    ("Llama-3.1-405B MBS=2", 16384, 16384, 16384),
+    ("Llama-3.1-405B MBS=2", 16384, 106496, 16384),
+    ("Llama-3.1-405B MBS=2", 16384, 16384, 53248),
+    ("Llama-3.1-405B MBS=4", 32768, 18432, 16384),
+    ("Llama-3.1-405B MBS=4", 32768, 16384, 16384),
+    ("Llama-3.1-405B MBS=4", 32768, 106496, 16384),
+    ("Llama-3.1-405B MBS=4", 32768, 16384, 53248),
+    ("Qwen2.5-7B MBS=1", 8192, 4608, 3584),
+    ("Qwen2.5-7B MBS=1", 8192, 3584, 3584),
+    ("Qwen2.5-7B MBS=1", 8192, 37888, 3584),
+    ("Qwen2.5-7B MBS=1", 8192, 3584, 18944),
+    ("Qwen2.5-7B MBS=2", 16384, 4608, 3584),
+    ("Qwen2.5-7B MBS=2", 16384, 3584, 3584),
+    ("Qwen2.5-7B MBS=2", 16384, 37888, 3584),
+    ("Qwen2.5-7B MBS=2", 16384, 3584, 18944),
+    ("Qwen2.5-7B MBS=4", 32768, 4608, 3584),
+    ("Qwen2.5-7B MBS=4", 32768, 3584, 3584),
+    ("Qwen2.5-7B MBS=4", 32768, 37888, 3584),
+    ("Qwen2.5-7B MBS=4", 32768, 3584, 18944),
+    ("Qwen2.5-72B MBS=1", 8192, 10240, 8192),
+    ("Qwen2.5-72B MBS=1", 8192, 8192, 8192),
+    ("Qwen2.5-72B MBS=1", 8192, 59136, 8192),
+    ("Qwen2.5-72B MBS=1", 8192, 8192, 29568),
+    ("Qwen2.5-72B MBS=2", 16384, 10240, 8192),
+    ("Qwen2.5-72B MBS=2", 16384, 8192, 8192),
+    ("Qwen2.5-72B MBS=2", 16384, 59136, 8192),
+    ("Qwen2.5-72B MBS=2", 16384, 8192, 29568),
+    ("Qwen2.5-72B MBS=4", 32768, 10240, 8192),
+    ("Qwen2.5-72B MBS=4", 32768, 8192, 8192),
+    ("Qwen2.5-72B MBS=4", 32768, 59136, 8192),
+    ("Qwen2.5-72B MBS=4", 32768, 8192, 29568),
+    ("Mistral-7B MBS=1", 4096, 6144, 4096),
+    ("Mistral-7B MBS=1", 4096, 4096, 4096),
+    ("Mistral-7B MBS=1", 4096, 28672, 4096),
+    ("Mistral-7B MBS=1", 4096, 4096, 14336),
+    ("Mistral-7B MBS=2", 8192, 6144, 4096),
+    ("Mistral-7B MBS=2", 8192, 4096, 4096),
+    ("Mistral-7B MBS=2", 8192, 28672, 4096),
+    ("Mistral-7B MBS=2", 8192, 4096, 14336),
+    ("Mistral-7B MBS=4", 16384, 6144, 4096),
+    ("Mistral-7B MBS=4", 16384, 4096, 4096),
+    ("Mistral-7B MBS=4", 16384, 28672, 4096),
+    ("Mistral-7B MBS=4", 16384, 4096, 14336),
+]
+
+
+def dedup_shapes(shapes):
+    seen = set()
+    out = []
+    for item in shapes:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def bench_one_shape(label, M, N, K, device="cuda", block_m=128, block_n=128, block_k=128,
+                    warmup=20, repeat=50):
+    A, B, A_scale, B_scale = make_mxfp8_data(M, N, K, device=device)
+    prepared = prepare_mxfp8_gemm_preshuffled_scales(
+        A, B, A_scale, B_scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+    )
+    gemm_fn = lambda: launch_mxfp8_gemm_preshuffled_scales(prepared)
+
+    _ = gemm_fn()
+    torch.cuda.synchronize()
+
+    fwd_ms = benchmark_forward_ms(gemm_fn, warmup=warmup, repeat=repeat)
+    flops = 2.0 * M * N * K
+    tflops = flops / (fwd_ms * 1e-3) / 1e12
+
+    return {
+        "label": label,
+        "M": M,
+        "N": N,
+        "K": K,
+        "fwd_ms": fwd_ms,
+        "tflops": tflops,
+    }
+
+
 def run_bench():
     if not torch.cuda.is_available():
         raise RuntimeError("torch.cuda/HIP device required")
@@ -396,52 +507,41 @@ def run_bench():
         raise RuntimeError("This example requires AMD CDNA4 / MI350X")
 
     device = "cuda"
+    block_m = 128
+    block_n = 128
+    block_k = 128
 
-    M = 4096
-    N = 12288
-    K = 4096
-
-    BLOCK_M = 128
-    BLOCK_N = 128
-    BLOCK_K = 128
-
-    # Quantization happens outside timing
-    A, B, A_scale, B_scale = make_mxfp8_data(M, N, K, device=device)
-
-    # Padding / shuffle / allocation also happen outside timing
-    prepared = prepare_mxfp8_gemm_preshuffled_scales(
-        A, B, A_scale, B_scale,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-
-    gemm_fn = lambda: launch_mxfp8_gemm_preshuffled_scales(prepared)
-
-    C = gemm_fn()
-    C_ref = reference_mxfp8_gemm(A, B, A_scale, B_scale, BLOCK_K=BLOCK_K)
-
-    diff = (C - C_ref).abs()
-    max_abs = diff.max().item()
-    mean_abs = diff.mean().item()
-
-    # Timed region is kernel launch only
-    fwd_ms = benchmark_forward_ms(gemm_fn, warmup=20, repeat=50)
-
-    # Logical GEMM FLOPs (exclude padded K from throughput metric)
-    flops = 2.0 * M * N * K
-    tflops = flops / (fwd_ms * 1e-3) / 1e12
+    shapes = dedup_shapes(SHAPES)
+    results = []
 
     print("device:", torch.cuda.get_device_properties(0).name)
-    print("shape:", (M, N, K))
-    print("K padded to:", prepared["K_pad"])
-    print("A dtype:", A.dtype, "B dtype:", B.dtype)
-    print("A_scale dtype:", A_scale.dtype, "B_scale dtype:", B_scale.dtype)
-    print("max_abs:", max_abs)
-    print("mean_abs:", mean_abs)
-    print("fwd_ms:", fwd_ms)
-    print("tflops:", tflops)
-    print("PASS:", bool(torch.allclose(C, C_ref, atol=2e-2, rtol=2e-2)))
+    print("num_shapes:", len(shapes))
+    print()
+
+    for idx, (label, M, N, K) in enumerate(shapes, start=1):
+        result = bench_one_shape(
+            label, M, N, K,
+            device=device,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            warmup=20,
+            repeat=50,
+        )
+        results.append(result)
+        print(
+            f"[{idx:02d}/{len(shapes)}] {label:20s} "
+            f"M={M:6d} N={N:6d} K={K:6d} "
+            f"fwd_ms={result['fwd_ms']:.4f} tflops={result['tflops']:.2f}"
+        )
+
+    tflops_list = [r["tflops"] for r in results]
+    avg_tflops = statistics.mean(tflops_list)
+    median_tflops = statistics.median(tflops_list)
+
+    print()
+    print(f"Average TFLOPS: {avg_tflops:.2f}")
+    print(f"Median TFLOPS:  {median_tflops:.2f}")
 
 
 if __name__ == "__main__":
