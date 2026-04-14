@@ -26,7 +26,7 @@ def is_hip_cdna4():
         return False
     props = torch.cuda.get_device_properties(0)
     name = props.name.lower()
-    return ("gfx950" in name) or ("cdna4" in name)
+    return ("gfx950" in name) or ("mi355" in name) or ("cdna4" in name)
 
 
 def ceil_div(x, y):
@@ -63,21 +63,30 @@ def quantize_a_mx32_fp8(a_bf16: torch.Tensor):
     return q.contiguous(), scales.contiguous()
 
 
-def quantize_b_mx32_fp8(b_bf16: torch.Tensor):
+def quantize_b_mx32_fp8_transposed_storage(b_bf16: torch.Tensor):
+    """
+    Input:
+      b_bf16 logical GEMM weight matrix with shape [K, N]
+
+    Output:
+      B_t:      physically stored as [N, K]
+      B_scale:  logical scale tensor [N, K//32]
+    """
     K, N = b_bf16.shape
     assert K % 32 == 0
-    # Kernel expects logical B_scale as [N, K//32]
+
     b_nk = b_bf16.transpose(0, 1).contiguous()
     N2, K2 = b_nk.shape
     assert N2 == N and K2 == K
+
     qk = K // 32
     b_blocks = b_nk.float().view(N, qk, 32)
     block_max = b_blocks.abs().amax(dim=2)
     scales_fp32 = _pow2_scale_from_maxabs(block_max)
+
     q_nk = (b_blocks / scales_fp32.unsqueeze(-1)).reshape(N, K).to(torch.float8_e4m3fn)
-    q_kn = q_nk.transpose(0, 1).contiguous()
     scales_nq = scales_fp32.to(torch.float8_e8m0fnu)
-    return q_kn.contiguous(), scales_nq.contiguous()
+    return q_nk.contiguous(), scales_nq.contiguous()
 
 
 def make_mxfp8_data(M, N, K, device="cuda"):
@@ -85,13 +94,19 @@ def make_mxfp8_data(M, N, K, device="cuda"):
     b_bf16 = torch.randn((K, N), device=device, dtype=torch.bfloat16)
 
     A, A_scale = quantize_a_mx32_fp8(a_bf16)
-    B, B_scale = quantize_b_mx32_fp8(b_bf16)
-    return A, B, A_scale, B_scale
+    B_t, B_scale = quantize_b_mx32_fp8_transposed_storage(b_bf16)
+    return A, B_t, A_scale, B_scale
 
 
-def pad_k_mxfp8(A, B, A_scale, B_scale, BLOCK_K=128):
+def pad_k_mxfp8_transposed_b(A, B_t, A_scale, B_scale, BLOCK_K=128):
+    """
+    A   : [M, K]
+    B_t : [N, K]
+    A_scale : [M, K//32]
+    B_scale : [N, K//32]
+    """
     M, K = A.shape
-    Kb, N = B.shape
+    N, Kb = B_t.shape
     assert K == Kb
 
     K_pad = ceil_to_multiple(K, BLOCK_K)
@@ -99,19 +114,21 @@ def pad_k_mxfp8(A, B, A_scale, B_scale, BLOCK_K=128):
     QK_pad = ceil_div(K_pad, 32)
 
     if K_pad == K:
-        return A, B, A_scale, B_scale, K_pad
+        return A, B_t, A_scale, B_scale, K_pad
 
     A_pad = torch.zeros((M, K_pad), device=A.device, dtype=A.dtype)
-    B_pad = torch.zeros((K_pad, N), device=B.device, dtype=B.dtype)
+    B_t_pad = torch.zeros((N, K_pad), device=B_t.device, dtype=B_t.dtype)
+
     A_pad[:, :K] = A
-    B_pad[:K, :] = B
+    B_t_pad[:, :K] = B_t
 
     A_scale_pad = torch.ones((M, QK_pad), device=A_scale.device, dtype=torch.float32).to(torch.float8_e8m0fnu)
     B_scale_pad = torch.ones((N, QK_pad), device=B_scale.device, dtype=torch.float32).to(torch.float8_e8m0fnu)
+
     A_scale_pad[:, :QK] = A_scale
     B_scale_pad[:, :QK] = B_scale
 
-    return A_pad, B_pad, A_scale_pad, B_scale_pad, K_pad
+    return A_pad, B_t_pad, A_scale_pad, B_scale_pad, K_pad
 
 
 def expand_scales_32(scales, K):
@@ -122,15 +139,6 @@ def shuffle_scales_cdna4_mxfp8(scales: torch.Tensor, mfma_nonkdim: int):
     """
     Input logical shape: [rows, K//32]
     Output packed shape: [rows//32, (K//32) * 32]
-
-    For mfma_nonkdim == 16:
-      logical [32, 8] scale tile is split into four [16, 4] chunks:
-        op0 = top-left
-        op1 = top-right
-        op2 = bottom-left
-        op3 = bottom-right
-      and packed in order:
-        op0, op2, op1, op3
     """
     scales_shuffled = scales.clone()
     sm, sn = scales_shuffled.shape
@@ -147,10 +155,10 @@ def shuffle_scales_cdna4_mxfp8(scales: torch.Tensor, mfma_nonkdim: int):
 
 
 @gluon.jit
-def blocked_mxfp8_kernel_preshuffled_scales_opt16(
+def blocked_mxfp8_kernel_preshuffled_scales_opt16_btrans(
     out_ptr,
     a_ptr,
-    b_ptr,
+    b_t_ptr,
     a_scale_ptr,
     b_scale_ptr,
     M,
@@ -177,8 +185,11 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
         warps_per_cta=[2, 2],
     )
 
+    # A is row-major [M, K], K contiguous.
     a_load_layout: gl.constexpr = gl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
-    b_load_layout: gl.constexpr = gl.BlockedLayout([1, 16], [32, 2], [4, 1], [1, 0])
+
+    # B_t is row-major [N, K], K contiguous. Load as an [N, K] tile first.
+    b_t_load_layout: gl.constexpr = gl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
 
     a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
@@ -204,7 +215,11 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
     acc = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
 
     a_m_idx = off_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, a_load_layout))[:, None]
-    b_n_idx = off_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, b_load_layout))[None, :]
+    a_k_idx_base = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, a_load_layout))[None, :]
+
+    # Load physical B_t as [BLOCK_N, BLOCK_K], K contiguous.
+    b_n_idx = off_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_t_load_layout))[:, None]
+    b_k_idx_base = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, b_t_load_layout))[None, :]
 
     a_scale_row = (off_m // 32) + gl.arange(
         0, BLOCK_M // 32, layout=gl.SliceLayout(1, scale_raw_layout)
@@ -220,9 +235,6 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
         0, BLOCK_K, layout=gl.SliceLayout(0, scale_raw_layout)
     )[None, :]
 
-    a_k_idx_base = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, a_load_layout))[None, :]
-    b_k_idx_base = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(1, b_load_layout))[:, None]
-
     qh: gl.constexpr = BLOCK_K // 128
     qk: gl.constexpr = BLOCK_K // 32
 
@@ -231,8 +243,12 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
         a = gl.amd.cdna4.buffer_load(a_ptr, a_m_idx * K + a_offs_k)
         a = gl.convert_layout(a, a_layout)
 
+        # Physical B_t storage is [N, K], row-major => addr = n*K + k
         b_offs_k = k0 + b_k_idx_base
-        b = gl.amd.cdna4.buffer_load(b_ptr, b_offs_k * N + b_n_idx)
+        b_t_raw = gl.amd.cdna4.buffer_load(b_t_ptr, b_n_idx * K + b_offs_k)
+
+        # Convert physical [N, K] tile into logical [K, N] tile before operand-1 layout conversion.
+        b = b_t_raw.permute(1, 0)
         b = gl.convert_layout(b, b_layout)
 
         a_scale_col = (k0 // 32) * 32 + a_scale_col_base
@@ -271,21 +287,21 @@ def blocked_mxfp8_kernel_preshuffled_scales_opt16(
     gl.amd.cdna4.buffer_store(c, out_ptr, out_offs_m * N + out_offs_n)
 
 
-def prepare_mxfp8_gemm_preshuffled_scales(
+def prepare_mxfp8_gemm_preshuffled_scales_btrans(
     A,
-    B,
+    B_t,
     A_scale,
     B_scale,
     BLOCK_M=128,
     BLOCK_N=128,
     BLOCK_K=128,
 ):
-    assert A.is_cuda and B.is_cuda and A_scale.is_cuda and B_scale.is_cuda
+    assert A.is_cuda and B_t.is_cuda and A_scale.is_cuda and B_scale.is_cuda
     M, K = A.shape
-    Kb, N = B.shape
+    N, Kb = B_t.shape
     assert K == Kb
     assert A.dtype == torch.float8_e4m3fn
-    assert B.dtype == torch.float8_e4m3fn
+    assert B_t.dtype == torch.float8_e4m3fn
     assert A_scale.dtype == torch.float8_e8m0fnu
     assert B_scale.dtype == torch.float8_e8m0fnu
 
@@ -293,8 +309,8 @@ def prepare_mxfp8_gemm_preshuffled_scales(
     assert BLOCK_N == 128
     assert BLOCK_K == 128
 
-    A_pad, B_pad, A_scale_pad, B_scale_pad, K_pad = pad_k_mxfp8(
-        A, B, A_scale, B_scale, BLOCK_K=BLOCK_K
+    A_pad, B_t_pad, A_scale_pad, B_scale_pad, K_pad = pad_k_mxfp8_transposed_b(
+        A, B_t, A_scale, B_scale, BLOCK_K=BLOCK_K
     )
 
     assert M % BLOCK_M == 0, f"M={M} must be divisible by BLOCK_M={BLOCK_M}"
@@ -311,7 +327,7 @@ def prepare_mxfp8_gemm_preshuffled_scales(
 
     return {
         "A_pad": A_pad,
-        "B_pad": B_pad,
+        "B_t_pad": B_t_pad,
         "A_scale_shuf": A_scale_shuf,
         "B_scale_shuf": B_scale_shuf,
         "C": C,
@@ -325,11 +341,11 @@ def prepare_mxfp8_gemm_preshuffled_scales(
     }
 
 
-def launch_mxfp8_gemm_preshuffled_scales(prepared):
-    blocked_mxfp8_kernel_preshuffled_scales_opt16[prepared["grid"]](
+def launch_mxfp8_gemm_preshuffled_scales_btrans(prepared):
+    blocked_mxfp8_kernel_preshuffled_scales_opt16_btrans[prepared["grid"]](
         prepared["C"],
         prepared["A_pad"],
-        prepared["B_pad"],
+        prepared["B_t_pad"],
         prepared["A_scale_shuf"],
         prepared["B_scale_shuf"],
         prepared["M"],
@@ -344,17 +360,55 @@ def launch_mxfp8_gemm_preshuffled_scales(prepared):
     return prepared["C"]
 
 
-def reference_mxfp8_gemm(A, B, A_scale, B_scale, BLOCK_K=128):
-    A_pad, B_pad, A_scale_pad, B_scale_pad, K_pad = pad_k_mxfp8(
-        A, B, A_scale, B_scale, BLOCK_K=BLOCK_K
+def reference_mxfp8_gemm_btrans(A, B_t, A_scale, B_scale, BLOCK_K=128):
+    A_pad, B_t_pad, A_scale_pad, B_scale_pad, K_pad = pad_k_mxfp8_transposed_b(
+        A, B_t, A_scale, B_scale, BLOCK_K=BLOCK_K
     )
 
     A_scale_full = expand_scales_32(A_scale_pad, K_pad)
-    B_scale_full = expand_scales_32(B_scale_pad, K_pad).T
+    B_scale_full = expand_scales_32(B_scale_pad, K_pad)
 
     A_ref = A_pad.float() * A_scale_full
-    B_ref = B_pad.float() * B_scale_full
-    return A_ref @ B_ref
+    B_t_ref = B_t_pad.float() * B_scale_full
+
+    return A_ref @ B_t_ref.T
+
+
+def validate_once(device="cuda", block_m=128, block_n=128, block_k=128):
+    M, N, K = 256, 256, 256
+
+    print(f"validate_once: M={M} N={N} K={K}")
+
+    A, B_t, A_scale, B_scale = make_mxfp8_data(M, N, K, device=device)
+    prepared = prepare_mxfp8_gemm_preshuffled_scales_btrans(
+        A, B_t, A_scale, B_scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+    )
+
+    out = launch_mxfp8_gemm_preshuffled_scales_btrans(prepared)
+    ref = reference_mxfp8_gemm_btrans(A, B_t, A_scale, B_scale, BLOCK_K=block_k)
+
+    torch.cuda.synchronize()
+
+    diff = (out.float() - ref.float()).abs()
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
+
+    atol = 2e-1
+    rtol = 2e-1
+    passed = torch.allclose(out.float(), ref.float(), atol=atol, rtol=rtol)
+
+    print(f"validation max_abs={max_abs:.6f}")
+    print(f"validation mean_abs={mean_abs:.6f}")
+    print(f"validation atol={atol} rtol={rtol}")
+    print(f"validation PASS={passed}")
+
+    if not passed:
+        raise RuntimeError(
+            f"Validation failed for transposed-B kernel: max_abs={max_abs}, mean_abs={mean_abs}"
+        )
 
 
 def benchmark_forward_ms(fn, warmup: int = 20, repeat: int = 50) -> float:
@@ -474,14 +528,14 @@ def dedup_shapes(shapes):
 
 def bench_one_shape(label, M, N, K, device="cuda", block_m=128, block_n=128, block_k=128,
                     warmup=20, repeat=50):
-    A, B, A_scale, B_scale = make_mxfp8_data(M, N, K, device=device)
-    prepared = prepare_mxfp8_gemm_preshuffled_scales(
-        A, B, A_scale, B_scale,
+    A, B_t, A_scale, B_scale = make_mxfp8_data(M, N, K, device=device)
+    prepared = prepare_mxfp8_gemm_preshuffled_scales_btrans(
+        A, B_t, A_scale, B_scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
     )
-    gemm_fn = lambda: launch_mxfp8_gemm_preshuffled_scales(prepared)
+    gemm_fn = lambda: launch_mxfp8_gemm_preshuffled_scales_btrans(prepared)
 
     _ = gemm_fn()
     torch.cuda.synchronize()
@@ -504,12 +558,19 @@ def run_bench():
     if not torch.cuda.is_available():
         raise RuntimeError("torch.cuda/HIP device required")
     if not is_hip_cdna4():
-        raise RuntimeError("This example requires AMD CDNA4 / MI350X")
+        raise RuntimeError("This example requires AMD CDNA4 / MI355X")
 
     device = "cuda"
     block_m = 128
     block_n = 128
     block_k = 128
+
+    validate_once(
+        device=device,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+    )
 
     shapes = dedup_shapes(SHAPES)
     results = []
