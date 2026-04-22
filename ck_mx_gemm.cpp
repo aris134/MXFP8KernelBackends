@@ -89,7 +89,7 @@ struct MxGemmConfig
     static constexpr int TileParitionerM01          = 4;
     static constexpr auto Scheduler                 = ck_tile::GemmPipelineScheduler::Intrawave;
     static constexpr ck_tile::index_t NumWaveGroups = 1;
-    static constexpr bool DoubleSmemBuffer          = false; // comp_async uses double buffer
+    static constexpr bool DoubleSmemBuffer          = true; // comp_async uses double buffer
     static constexpr bool Preshuffle                = false;
 
     static constexpr int N_Repeat          = N_Tile / N_Warp_Tile / N_Warp;
@@ -101,6 +101,13 @@ struct MXfp8_GemmConfig16 : MxGemmConfig
     static constexpr ck_tile::index_t M_Tile = 64;
     static constexpr ck_tile::index_t N_Tile = 64;
     static constexpr ck_tile::index_t K_Tile = 256;
+};
+
+struct MXfp8_GemmConfig_256x64x128 : MxGemmConfig
+{
+    static constexpr ck_tile::index_t M_Tile = 256;
+    static constexpr ck_tile::index_t N_Tile = 64;
+    static constexpr ck_tile::index_t K_Tile = 128;
 };
 
 template <typename Layout>
@@ -579,7 +586,7 @@ int run_mx_gemm_example(int argc, char* argv[])
     return run_mx_gemm_with_layouts<ck_tile::fp8_t,
                                     ck_tile::fp8_t,
                                     float,
-                                    MXfp8_GemmConfig16,
+                                    MXfp8_GemmConfig_256x64x128,//MXfp8_GemmConfig16,
                                     true>(argc, argv, Row{}, Col{}, Row{});
 }
 
